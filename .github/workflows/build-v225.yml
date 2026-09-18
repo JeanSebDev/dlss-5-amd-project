@@ -18,6 +18,16 @@ jobs:
       - name: Add MSBuild to PATH
         uses: microsoft/setup-msbuild@v2
 
+      - name: Install Vulkan SDK import library
+        shell: pwsh
+        run: |
+          choco install vulkan-sdk --yes --no-progress
+          $sdk = Get-ChildItem 'C:\VulkanSDK' -Directory | Sort-Object Name -Descending | Select-Object -First 1
+          if (-not $sdk) { throw 'Vulkan SDK installation was not found' }
+          $target = 'OptiScaler-DLSSNR-PreSR-Multipass-main\OptiScaler\library\vulkan'
+          New-Item -ItemType Directory -Force -Path $target | Out-Null
+          Copy-Item -LiteralPath (Join-Path $sdk.FullName 'Lib\vulkan-1.lib') -Destination $target -Force
+
       - name: Build corrected OptiScaler
         working-directory: OptiScaler-DLSSNR-PreSR-Multipass-main
         run: msbuild OptiScaler.sln /m /p:Configuration=Release /p:Platform=x64 /verbosity:minimal
