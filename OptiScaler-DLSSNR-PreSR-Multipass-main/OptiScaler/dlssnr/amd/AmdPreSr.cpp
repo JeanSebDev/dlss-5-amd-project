@@ -162,7 +162,7 @@ RWTexture2D<float> dst : register(u0);
 cbuffer Extent : register(b0) { uint w; uint h; float preExposure; float exposureScale; };
 [numthreads(1,1,1)] void main(uint3 p:SV_DispatchThreadID) {
  float e=src.Load(int3(0,0,0)).r*exposureScale/preExposure;
- dst[uint2(0,0)]=isfinite(e) && e>0 ? e : 1.0;
+ dst[uint2(0,0)]=e>0 && e<3e38 ? e : 1.0;
 })";
 DXGI_FORMAT DepthReadFormat(DXGI_FORMAT f)
 {
@@ -197,7 +197,7 @@ bool HashMatches(const std::filesystem::path& file)
 {
     std::ifstream in(file, std::ios::binary);
     std::vector<unsigned char> data((std::istreambuf_iterator<char>(in)), {});
-    if (data.size() != 7156224)
+    if (data.size() != 7290880)
         return false;
     BCRYPT_ALG_HANDLE alg {};
     unsigned char digest[32] {};
