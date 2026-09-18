@@ -18,23 +18,15 @@ jobs:
       - name: Add MSBuild to PATH
         uses: microsoft/setup-msbuild@v2
 
-      - name: Install Vulkan SDK import library
+      - name: Restore published OptiScaler link libraries
         shell: pwsh
         run: |
-          choco install vulkan-sdk --yes --no-progress
-          $sdk = Get-ChildItem 'C:\VulkanSDK' -Directory | Sort-Object Name -Descending | Select-Object -First 1
-          if (-not $sdk) { throw 'Vulkan SDK installation was not found' }
-          $target = 'OptiScaler-DLSSNR-PreSR-Multipass-main\OptiScaler\library\vulkan'
-          New-Item -ItemType Directory -Force -Path $target | Out-Null
-          Copy-Item -LiteralPath (Join-Path $sdk.FullName 'Lib\vulkan-1.lib') -Destination $target -Force
-
-      - name: Build static FreeType dependency
-        shell: pwsh
-        run: |
-          & "$env:VCPKG_INSTALLATION_ROOT\vcpkg.exe" install 'freetype[core]:x64-windows-static' --clean-after-build
-          $library = Join-Path $env:VCPKG_INSTALLATION_ROOT 'installed\x64-windows-static\lib\freetype.lib'
-          if (-not (Test-Path -LiteralPath $library)) { throw 'Static FreeType library was not built' }
-          Copy-Item -LiteralPath $library -Destination 'OptiScaler-DLSSNR-PreSR-Multipass-main\external\freetype\freetype.lib' -Force
+          git clone --filter=blob:none --no-checkout https://github.com/wilsjo2/OptiScaler-DLSSNR-PreSR-Multipass.git upstream-deps
+          git -C upstream-deps sparse-checkout init --cone
+          git -C upstream-deps sparse-checkout set OptiScaler/library external/freetype
+          git -C upstream-deps checkout e237f895623742b761f9e5f00067cb3dc62619f4
+          Copy-Item -LiteralPath 'upstream-deps\OptiScaler\library' -Destination 'OptiScaler-DLSSNR-PreSR-Multipass-main\OptiScaler' -Recurse -Force
+          Copy-Item -LiteralPath 'upstream-deps\external\freetype\freetype.lib' -Destination 'OptiScaler-DLSSNR-PreSR-Multipass-main\external\freetype\freetype.lib' -Force
 
       - name: Build corrected OptiScaler
         working-directory: OptiScaler-DLSSNR-PreSR-Multipass-main
