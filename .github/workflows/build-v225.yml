@@ -28,6 +28,14 @@ jobs:
           New-Item -ItemType Directory -Force -Path $target | Out-Null
           Copy-Item -LiteralPath (Join-Path $sdk.FullName 'Lib\vulkan-1.lib') -Destination $target -Force
 
+      - name: Build static FreeType dependency
+        shell: pwsh
+        run: |
+          & "$env:VCPKG_INSTALLATION_ROOT\vcpkg.exe" install 'freetype[core]:x64-windows-static' --clean-after-build
+          $library = Join-Path $env:VCPKG_INSTALLATION_ROOT 'installed\x64-windows-static\lib\freetype.lib'
+          if (-not (Test-Path -LiteralPath $library)) { throw 'Static FreeType library was not built' }
+          Copy-Item -LiteralPath $library -Destination 'OptiScaler-DLSSNR-PreSR-Multipass-main\external\freetype\freetype.lib' -Force
+
       - name: Build corrected OptiScaler
         working-directory: OptiScaler-DLSSNR-PreSR-Multipass-main
         run: msbuild OptiScaler.sln /m /p:Configuration=Release /p:Platform=x64 /verbosity:minimal
