@@ -370,7 +370,10 @@ struct Backend::Impl
         At<ID3D12CommandQueue*>(h, Rt::Queue) = queue.Get();
         queue->AddRef();
         At<int>(h, Rt::HipDevice) = hipDevice;
-        At<uint8_t>(h, Rt::InlineMode) = 1;
+        // Proton cannot import the D3D12 resources into HIP on current RADV.
+        // Keep the runtime in its asynchronous readback/upload path; asking for
+        // inline mode and relying on its late fallback blocks the first RecordFn.
+        At<uint8_t>(h, Rt::InlineMode) = 0;
         At<uint8_t>(h, Rt::Interop) = 1;
         At<uint8_t>(h, Rt::Enabled) = 1;
         At<uint8_t>(h, Rt::UseFsrInputs) = 1;
@@ -797,6 +800,10 @@ ID3D12Resource* Backend::Record(ID3D12GraphicsCommandList* cmd, const Frame& inc
         for (UINT i = 0; i < p->activePasses; ++i)
         {
             auto r = p->runtime[i];
+            // The runtime reloads its ini while the game is running. Pin this
+            // back to async before every record so a reload cannot reintroduce
+            // the Proton first-frame deadlock.
+            At<uint8_t>(r, Rt::InlineMode) = 0;
             At<uint8_t>(r, Rt::Temporal) = 1;
             // Engine +0x120 is the history-valid flag, +0x118 is the current
             // borrowed history view. Clear only at a quiescent frame boundary.
