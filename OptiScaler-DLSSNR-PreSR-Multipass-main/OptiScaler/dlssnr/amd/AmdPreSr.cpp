@@ -56,39 +56,39 @@ using RecordFn = void(__fastcall*)(Packet*);
 using NotifyFn = void(__fastcall*)(ID3D12CommandQueue*, UINT, ID3D12CommandList* const*);
 using HipSetFn = int (*)(int);
 
-// DLSS-NR-on-AMD v0.3.0 (patched runtime hash in RuntimeHash.h).  Keep the
+// DLSS-NR-on-AMD v0.3.1 (patched runtime hash in RuntimeHash.h).  Keep the
 // binary contract named in one place: every value below is an RVA into that
 // exact private runtime build.
 namespace Rt
 {
-constexpr size_t Device = 0x96f68;
-constexpr size_t Queue = 0x96f70;
-constexpr size_t EngineObject = 0x96f78;
-constexpr size_t History = 0x97090;
-constexpr size_t HistoryOn = 0x97098;
-constexpr size_t Ready = 0x97298;
-constexpr size_t NativeFailure = 0x9729a;
-constexpr size_t InlineMode = 0x977a0;
-constexpr size_t JobCounter = 0x977d4;
-constexpr size_t Interop = 0x97984;
-constexpr size_t ListMarker = 0x97a60;
-constexpr size_t JobId = 0x97a6c;
-constexpr size_t DepthInverted = 0x97b10;
-constexpr size_t FsrFlagsSeen = 0x97b14;
-constexpr size_t Enabled = 0x97b1c;
-constexpr size_t Temporal = 0x97b1d;
-constexpr size_t UseFsrInputs = 0x97b1e;
-constexpr size_t UseDepth = 0x97b1f;
-constexpr size_t Tonemap = 0x97b20;
-constexpr size_t LocalTone = 0x97b30;
-constexpr size_t LocalStructure = 0x97b34;
-constexpr size_t SkinStructure = 0x97b38;
-constexpr size_t UseAutoMask = 0x97b40;
-constexpr size_t ToneChannels = 0x97b44;
-constexpr size_t HipDevice = 0x97c30;
-constexpr size_t NotifyFn = 0x9460;
-constexpr size_t RecordFn = 0x12640;
-constexpr size_t InitFn = 0x1fe80;
+constexpr size_t Device = 0x9a0e8;
+constexpr size_t Queue = 0x9a0f0;
+constexpr size_t EngineObject = 0x9a0f8;
+constexpr size_t History = 0x9a218;
+constexpr size_t HistoryOn = 0x9a220;
+constexpr size_t Ready = 0x9a420;
+constexpr size_t NativeFailure = 0x9a422;
+constexpr size_t InlineMode = 0x9a928;
+constexpr size_t JobCounter = 0x9a95c;
+constexpr size_t Interop = 0x9ab0c;
+constexpr size_t ListMarker = 0x9ac38;
+constexpr size_t JobId = 0x9ac44;
+constexpr size_t DepthInverted = 0x9ace8;
+constexpr size_t FsrFlagsSeen = 0x9acec;
+constexpr size_t Enabled = 0x9acf4;
+constexpr size_t Temporal = 0x9acf5;
+constexpr size_t UseFsrInputs = 0x9acf6;
+constexpr size_t UseDepth = 0x9acf7;
+constexpr size_t Tonemap = 0x9acf8;
+constexpr size_t LocalTone = 0x9ad08;
+constexpr size_t LocalStructure = 0x9ad0c;
+constexpr size_t SkinStructure = 0x9ad10;
+constexpr size_t UseAutoMask = 0x9ad18;
+constexpr size_t ToneChannels = 0x9ad1c;
+constexpr size_t HipDevice = 0x9ae08;
+constexpr size_t NotifyFn = 0x9720;
+constexpr size_t RecordFn = 0x13540;
+constexpr size_t InitFn = 0x21720;
 }
 constexpr char CopyShader[] = R"(
 Texture2D<float4> src : register(t0);
@@ -197,7 +197,7 @@ bool HashMatches(const std::filesystem::path& file)
 {
     std::ifstream in(file, std::ios::binary);
     std::vector<unsigned char> data((std::istreambuf_iterator<char>(in)), {});
-    if (data.size() != 7290880)
+    if (data.size() != 7304192)
         return false;
     BCRYPT_ALG_HANDLE alg {};
     unsigned char digest[32] {};
@@ -363,7 +363,7 @@ struct Backend::Impl
                            reinterpret_cast<LPCWSTR>(h), &pinned);
         // Retain module even on failure: CRT registered HIP kernels; no unsafe unloading.
         runtime[i] = h;
-        // v0.3.0 embeds precompiled apply shaders, avoiding Wine's incomplete
+        // v0.3.1 embeds precompiled apply shaders, avoiding Wine's incomplete
         // D3DCompiler path that made v0.2.14 stall after HIP inference.
         At<ID3D12Device*>(h, Rt::Device) = device.Get();
         device->AddRef();
@@ -810,7 +810,7 @@ ID3D12Resource* Backend::Record(ID3D12GraphicsCommandList* cmd, const Frame& inc
             At<float>(r, Rt::LocalTone) = i == 0 ? cfg.tone : 0;
             At<float>(r, Rt::LocalStructure) = cfg.structure;
             At<float>(r, Rt::SkinStructure) = cfg.skin;
-            // Bit 4 enables v0.3.0's safe timeout path; bit 2 stays clear so
+            // Bit 4 enables v0.3.1's safe timeout path; bit 2 stays clear so
             // a late job never pastes a residual from an older frame.
             At<UINT>(r, Rt::ToneChannels) = (cfg.toneChannels ? 1u : 0u) | 4u;
             At<UINT>(r, Rt::UseAutoMask) = 1;
@@ -1113,7 +1113,7 @@ bool Backend::Shutdown()
     p->RetireSingle();
     if (p->pending.load() || p->fence->GetCompletedValue() < p->completion.load())
         return false;
-    // Runtime modules are pinned for process lifetime.  v0.3.0 has no stable
+    // Runtime modules are pinned for process lifetime.  v0.3.1 has no stable
     // exported shutdown entry, so do not jump through the v0.2.14 RVA here.
     p->failed = true;
     p->Log("AMD runtime quiescent; pinned workers left for process teardown");
