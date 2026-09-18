@@ -63,7 +63,7 @@ namespace Rt
 {
 constexpr size_t Device = 0x9a0e8;
 constexpr size_t Queue = 0x9a0f0;
-constexpr size_t EngineObject = 0x9a0f8;
+constexpr size_t EngineObject = 0x9a100;
 constexpr size_t History = 0x9a218;
 constexpr size_t HistoryOn = 0x9a220;
 constexpr size_t Ready = 0x9a420;
