@@ -55,6 +55,41 @@ using InitFn = bool(__fastcall*)(void*, const std::string*);
 using RecordFn = void(__fastcall*)(Packet*);
 using NotifyFn = void(__fastcall*)(ID3D12CommandQueue*, UINT, ID3D12CommandList* const*);
 using HipSetFn = int (*)(int);
+
+// DLSS-NR-on-AMD v0.3.0 (patched runtime hash in RuntimeHash.h).  Keep the
+// binary contract named in one place: every value below is an RVA into that
+// exact private runtime build.
+namespace Rt
+{
+constexpr size_t Device = 0x96f68;
+constexpr size_t Queue = 0x96f70;
+constexpr size_t EngineObject = 0x96f78;
+constexpr size_t History = 0x97090;
+constexpr size_t HistoryOn = 0x97098;
+constexpr size_t Ready = 0x97298;
+constexpr size_t NativeFailure = 0x9729a;
+constexpr size_t InlineMode = 0x977a0;
+constexpr size_t JobCounter = 0x977d4;
+constexpr size_t Interop = 0x97984;
+constexpr size_t ListMarker = 0x97a60;
+constexpr size_t JobId = 0x97a6c;
+constexpr size_t DepthInverted = 0x97b10;
+constexpr size_t FsrFlagsSeen = 0x97b14;
+constexpr size_t Enabled = 0x97b1c;
+constexpr size_t Temporal = 0x97b1d;
+constexpr size_t UseFsrInputs = 0x97b1e;
+constexpr size_t UseDepth = 0x97b1f;
+constexpr size_t Tonemap = 0x97b20;
+constexpr size_t LocalTone = 0x97b30;
+constexpr size_t LocalStructure = 0x97b34;
+constexpr size_t SkinStructure = 0x97b38;
+constexpr size_t UseAutoMask = 0x97b40;
+constexpr size_t ToneChannels = 0x97b44;
+constexpr size_t HipDevice = 0x97c30;
+constexpr size_t NotifyFn = 0x9460;
+constexpr size_t RecordFn = 0x12640;
+constexpr size_t InitFn = 0x1fe80;
+}
 constexpr char CopyShader[] = R"(
 Texture2D<float4> src : register(t0);
 RWTexture2D<float4> dst : register(u0);
@@ -247,7 +282,7 @@ struct Backend::Impl
     {
         if (!asyncSingle) return;
         auto done = static_cast<UINT>(InterlockedCompareExchange(
-            reinterpret_cast<volatile LONG*>(&At<UINT>(runtime[0], 0x76c14)), 0, 0));
+            reinterpret_cast<volatile LONG*>(&At<UINT>(runtime[0], Rt::JobCounter)), 0, 0));
         if (done < jobs[0] || fence->GetCompletedValue() < completion.load())
         {
             if (!failed && GetTickCount64() - asyncStart > 5000)
@@ -262,7 +297,7 @@ struct Backend::Impl
         asyncSingle = false;
         pending.store(nullptr, std::memory_order_release);
         lastSubmitted = GetTickCount64();
-        if (!failed && At<UINT>(runtime[0], 0x76c18) == observedTimeouts[0])
+        if (!failed)
         {
             ++completedFrames;
             lastCompleted = lastSubmitted;
@@ -328,44 +363,24 @@ struct Backend::Impl
                            reinterpret_cast<LPCWSTR>(h), &pinned);
         // Retain module even on failure: CRT registered HIP kernels; no unsafe unloading.
         runtime[i] = h;
-        // The hash above fixes this private module's import layout. Older games
-        // ship a 2013 D3DCompiler that rejects the FP16 typed UAV load shader.
-        // Bind only this module's compiler import; leave the game's DLL intact.
-        static HMODULE systemCompiler = [] {
-            wchar_t systemPath[MAX_PATH] {};
-            auto length = GetSystemDirectoryW(systemPath, MAX_PATH);
-            if (!length || length >= MAX_PATH) return HMODULE(nullptr);
-            auto path = std::filesystem::path(systemPath) / L"d3dcompiler_47.dll";
-            return LoadLibraryExW(path.c_str(), nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
-        }();
-        auto compile = systemCompiler ? GetProcAddress(systemCompiler, "D3DCompile") : nullptr;
-        if (!compile) throw std::runtime_error("System D3DCompile unavailable for AMD neural shaders");
-        auto import = reinterpret_cast<void**>(reinterpret_cast<uintptr_t>(h) + 0x6bb50);
-        DWORD previousProtection = 0;
-        if (!VirtualProtect(import, sizeof(void*), PAGE_READWRITE, &previousProtection))
-            throw std::runtime_error("Could not bind private AMD shader compiler");
-        InterlockedExchangePointer(import, reinterpret_cast<void*>(compile));
-        DWORD unused = 0;
-        if (!VirtualProtect(import, sizeof(void*), previousProtection, &unused))
-            throw std::runtime_error("Could not restore private AMD import protection");
-        Log("Private AMD shaders use System32 D3DCompiler; game compiler preserved");
-
-        At<ID3D12Device*>(h, 0x764c8) = device.Get();
+        // v0.3.0 embeds precompiled apply shaders, avoiding Wine's incomplete
+        // D3DCompiler path that made v0.2.14 stall after HIP inference.
+        At<ID3D12Device*>(h, Rt::Device) = device.Get();
         device->AddRef();
-        At<ID3D12CommandQueue*>(h, 0x764d0) = queue.Get();
+        At<ID3D12CommandQueue*>(h, Rt::Queue) = queue.Get();
         queue->AddRef();
-        At<int>(h, 0x76f20) = hipDevice;
-        At<uint8_t>(h, 0x76be0) = 1; // configured inline; 0x76be1 is staging state
-        At<uint8_t>(h, 0x76c8c) = 1; // external-memory interop
-        At<uint8_t>(h, 0x76e1c) = 1; // enabled
-        At<uint8_t>(h, 0x76e1e) = 1; // FSR inputs, no swapchain fallback
-        At<uint8_t>(h, 0x76e1f) = 1; // depth
-        At<int>(h, 0x76e20) = -1;    // auto tonemap by input format
+        At<int>(h, Rt::HipDevice) = hipDevice;
+        At<uint8_t>(h, Rt::InlineMode) = 1;
+        At<uint8_t>(h, Rt::Interop) = 1;
+        At<uint8_t>(h, Rt::Enabled) = 1;
+        At<uint8_t>(h, Rt::UseFsrInputs) = 1;
+        At<uint8_t>(h, Rt::UseDepth) = 1;
+        At<int>(h, Rt::Tonemap) = -1;
         std::string file = weights.string();
-        if (hipSet(hipDevice) != 0 || !reinterpret_cast<InitFn>(reinterpret_cast<uintptr_t>(h) + 0x12380)(
-                                          reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(h) + 0x764d8), &file))
+        if (hipSet(hipDevice) != 0 || !reinterpret_cast<InitFn>(reinterpret_cast<uintptr_t>(h) + Rt::InitFn)(
+                                          reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(h) + Rt::EngineObject), &file))
             throw std::runtime_error("AMD engine initialization failed");
-        At<uint8_t>(h, 0x767f8) = 1;
+        At<uint8_t>(h, Rt::Ready) = 1;
         Log("Initialized independent AMD pass " + std::to_string(i + 1));
     }
     void InitShader()
@@ -470,27 +485,6 @@ ID3D12Resource* Backend::Record(ID3D12GraphicsCommandList* cmd, const Frame& inc
         }
         if (++p->fenceRecoveries <= 3 || p->fenceRecoveries % 120 == 0)
             p->Log("AMD continuity: prior GPU work retired after short wait; count=" + std::to_string(p->fenceRecoveries));
-    }
-    bool timedOut = false;
-    for (UINT i = 0; i < p->runtime.size(); ++i)
-        if (auto h = p->runtime[i])
-        {
-            UINT count = static_cast<UINT>(
-                InterlockedCompareExchange(reinterpret_cast<volatile LONG*>(&At<UINT>(h, 0x76c18)), 0, 0));
-            if (count > p->observedTimeouts[i])
-            {
-                p->timeoutEvents += count - p->observedTimeouts[i];
-                timedOut = true;
-            }
-            // The native count resets when staging is recreated.
-            p->observedTimeouts[i] = count;
-        }
-    if (timedOut)
-    {
-        p->retryAfter = GetTickCount64() + 1000;
-        p->resetAfterTimeout = true;
-        p->Log("AMD timeout: current input preserved; retry in 1s with fresh history. Events=" +
-               std::to_string(p->timeoutEvents));
     }
     if (GetTickCount64() < p->retryAfter)
         return nullptr;
@@ -803,28 +797,23 @@ ID3D12Resource* Backend::Record(ID3D12GraphicsCommandList* cmd, const Frame& inc
         for (UINT i = 0; i < p->activePasses; ++i)
         {
             auto r = p->runtime[i];
-            At<uint8_t>(r, 0x76e1d) = 1;
+            At<uint8_t>(r, Rt::Temporal) = 1;
             // Engine +0x120 is the history-valid flag, +0x118 is the current
             // borrowed history view. Clear only at a quiescent frame boundary.
             if (f.reset || resize || guideChange || passChange || p->resetAfterTimeout || settingsChanged || explicitReset || gap)
             {
-                At<uint8_t>(r, 0x765f8) = 0;
-                At<void*>(r, 0x765f0) = nullptr;
+                At<uint8_t>(r, Rt::HistoryOn) = 0;
+                At<void*>(r, Rt::History) = nullptr;
             }
-            At<UINT>(r, 0x76e10) = f.depthInverted;
-            At<uint8_t>(r, 0x76e14) = 1; // explicit depth convention, no heuristic
-            At<float>(r, 0x76e30) = i == 0 ? cfg.tone : 0;
-            At<float>(r, 0x76e34) = cfg.structure;
-            At<float>(r, 0x76e38) = cfg.skin;
-            At<UINT>(r,0x76e44)=cfg.toneChannels?1u:0u;
-            At<UINT>(r, 0x76e40) = 1; // Enable native semantic character-mask channel.
-            // The old shader ceiling expired at high render resolutions even
-            // when inference finished well inside the native 600 ms watchdog.
-            // Scale the spin allowance with pixels, but retain a hard ceiling
-            // in the private shader if notification is lost. This is an
-            // iteration allowance, not a portable millisecond conversion.
-            At<UINT>(r, 0x76c44) = static_cast<UINT>(std::clamp<UINT64>(
-                262144 + (UINT64(w) * h + 1) / 2, 262144, 2097152));
+            At<UINT>(r, Rt::DepthInverted) = f.depthInverted;
+            At<uint8_t>(r, Rt::FsrFlagsSeen) = 1;
+            At<float>(r, Rt::LocalTone) = i == 0 ? cfg.tone : 0;
+            At<float>(r, Rt::LocalStructure) = cfg.structure;
+            At<float>(r, Rt::SkinStructure) = cfg.skin;
+            // Bit 4 enables v0.3.0's safe timeout path; bit 2 stays clear so
+            // a late job never pastes a residual from an older frame.
+            At<UINT>(r, Rt::ToneChannels) = (cfg.toneChannels ? 1u : 0u) | 4u;
+            At<UINT>(r, Rt::UseAutoMask) = 1;
             Packet packet {};
             packet.list = cmd;
             packet.colour = p->colour.Get();
@@ -837,29 +826,20 @@ ID3D12Resource* Backend::Record(ID3D12GraphicsCommandList* cmd, const Frame& inc
             packet.exposureState = 4;
             packet.scaleX = f.motionScaleX * (resampleMotion ? float(w) / mvW : 1.0f);
             packet.scaleY = f.motionScaleY * (resampleMotion ? float(h) / mvH : 1.0f);
-            reinterpret_cast<RecordFn>(reinterpret_cast<uintptr_t>(r) + 0xa0b0)(&packet);
-            p->jobs[i] = At<UINT>(r, 0x76d74);
+            reinterpret_cast<RecordFn>(reinterpret_cast<uintptr_t>(r) + Rt::RecordFn)(&packet);
+            p->jobs[i] = At<UINT>(r, Rt::JobId);
             // Staging recreation resets the native job counter. After a resize,
             // job 1 can follow job 1, so counter equality does not mean rejection.
             // The native pending-list pointer is the actual submission contract.
-            const bool recorded = At<ID3D12CommandList*>(r, 0x76d68) == cmd;
+            const bool recorded = At<ID3D12CommandList*>(r, Rt::ListMarker) == cmd;
             if (recorded)
-            {
-                // Recreated staging restarts job IDs, but the mapped watchdog
-                // abort word can retain a larger ID from the preceding extent.
-                // At this point the preceding GPU fence and HIP job have retired,
-                // and this list has not been submitted. Clear the obsolete abort
-                // token; the watchdog remains active once Notify publishes this job.
-                if (auto abortWord = At<volatile LONG*>(r, 0x76c68))
-                    InterlockedExchange(abortWord, 0);
                 ++accepted;
-            }
-            if (At<uint8_t>(r, 0x767fa) || !recorded)
+            if (At<uint8_t>(r, Rt::NativeFailure) || !recorded)
             {
                 p->failed = true;
                 p->Log("AMD pass rejected frame: " + std::to_string(i + 1) + " job=" + std::to_string(p->jobs[i]) +
                        " pending=" + std::to_string(recorded) +
-                       " nativeFailure=" + std::to_string(At<uint8_t>(r, 0x767fa)));
+                       " nativeFailure=" + std::to_string(At<uint8_t>(r, Rt::NativeFailure)));
                 // Even on failure, any recorded work must be published after
                 // submission so its GPU-side wait is not left without a worker.
                 break;
@@ -1021,9 +1001,9 @@ void Backend::Submitting(ID3D12CommandQueue* queue, UINT n, ID3D12CommandList* c
         for (auto h : p->runtime)
             if (h)
             {
-                auto old = At<ID3D12CommandQueue*>(h, 0x764d0);
+                auto old = At<ID3D12CommandQueue*>(h, Rt::Queue);
                 queue->AddRef();
-                At<ID3D12CommandQueue*>(h, 0x764d0) = queue;
+                At<ID3D12CommandQueue*>(h, Rt::Queue) = queue;
                 if (old)
                     old->Release();
             }
@@ -1054,7 +1034,7 @@ void Backend::Submitted(ID3D12CommandQueue* queue, UINT n, ID3D12CommandList* co
     if (p->activePasses == 1)
     {
         auto h = p->runtime[0];
-        reinterpret_cast<NotifyFn>(reinterpret_cast<uintptr_t>(h) + 0x4640)(queue, n, lists);
+        reinterpret_cast<NotifyFn>(reinterpret_cast<uintptr_t>(h) + Rt::NotifyFn)(queue, n, lists);
         p->firstPublished = true;
         auto value = ++p->serial;
         if (FAILED(queue->Signal(p->fence.Get(), value)))
@@ -1072,11 +1052,11 @@ void Backend::Submitted(ID3D12CommandQueue* queue, UINT n, ID3D12CommandList* co
     {
         auto h = p->runtime[i];
         if (i != 0 || !p->firstPublished)
-            reinterpret_cast<NotifyFn>(reinterpret_cast<uintptr_t>(h) + 0x4640)(queue, n, lists);
+            reinterpret_cast<NotifyFn>(reinterpret_cast<uintptr_t>(h) + Rt::NotifyFn)(queue, n, lists);
         // All runtimes use HIP stream 0. Publish the next pass only once the previous
         // worker finished; otherwise its capture-wait kernel could block the first pass.
         auto start = GetTickCount64();
-        while (static_cast<UINT>(InterlockedCompareExchange(reinterpret_cast<volatile LONG*>(&At<UINT>(h, 0x76c14)), 0,
+        while (static_cast<UINT>(InterlockedCompareExchange(reinterpret_cast<volatile LONG*>(&At<UINT>(h, Rt::JobCounter)), 0,
                                                             0)) < p->jobs[i])
         {
             if (GetTickCount64() - start > 5000)
@@ -1099,16 +1079,6 @@ void Backend::Submitted(ID3D12CommandQueue* queue, UINT n, ID3D12CommandList* co
     p->lastSubmitted = GetTickCount64();
     if (!p->failed)
     {
-        bool timedOut = false;
-        for (UINT i = 0; i < p->activePasses; ++i)
-            timedOut |= At<UINT>(p->runtime[i], 0x76c18) > p->observedTimeouts[i];
-        if (timedOut)
-        {
-            // Record consumes the native counters and schedules safe recovery.
-            // A completed HIP job is not proof that its GPU output was applied.
-            p->Log("AMD timeout: current input preserved; recovery pending");
-            return;
-        }
         ++p->completedFrames;
         p->lastCompleted = p->lastSubmitted;
         auto completed = "Completed AMD pre-SR passes=" + std::to_string(p->activePasses) + " at " +
@@ -1123,18 +1093,9 @@ std::string Backend::Status() const
 {
     std::lock_guard guard(p->lock);
     p->RetireSingle();
-    auto reportedTimeouts = p->timeoutEvents;
-    for (UINT i = 0; i < p->runtime.size(); ++i)
-        if (p->runtime[i])
-        {
-            auto count = At<UINT>(p->runtime[i], 0x76c18);
-            if (count > p->observedTimeouts[i])
-                reportedTimeouts += count - p->observedTimeouts[i];
-        }
     if (!p->failed && p->lastSubmitted)
         return p->status + (p->rtgiStatus.empty() ? "" : " | " + p->rtgiStatus) + " | completed frames=" + std::to_string(p->completedFrames) +
                (p->lastCompleted ? " last completion " + std::to_string((GetTickCount64() - p->lastCompleted) / 1000) + "s ago" : " no successful completion") +
-               " | timeout events=" + std::to_string(reportedTimeouts) +
                " | skipped pending/GPU=" + std::to_string(p->pendingSkips) + "/" + std::to_string(p->fenceSkips);
     return p->status;
 }
@@ -1152,15 +1113,10 @@ bool Backend::Shutdown()
     p->RetireSingle();
     if (p->pending.load() || p->fence->GetCompletedValue() < p->completion.load())
         return false;
-    for (auto h : p->runtime)
-        if (h)
-        {
-            if (p->hipSet)
-                p->hipSet(p->hipDevice);
-            reinterpret_cast<void (*)()>(reinterpret_cast<uintptr_t>(h) + 0xc520)();
-        }
+    // Runtime modules are pinned for process lifetime.  v0.3.0 has no stable
+    // exported shutdown entry, so do not jump through the v0.2.14 RVA here.
     p->failed = true;
-    p->Log("Workers stopped outside loader lock");
+    p->Log("AMD runtime quiescent; pinned workers left for process teardown");
     return true;
 }
 } // namespace AmdPreSr
