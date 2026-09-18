@@ -213,6 +213,16 @@ bool HashMatches(const std::filesystem::path& file)
     BCryptCloseAlgorithmProvider(alg, 0);
     return result >= 0 && std::memcmp(digest, AmdRuntimeSha256, 32) == 0;
 }
+bool IsFf7Rebirth()
+{
+    wchar_t path[MAX_PATH] {};
+    const DWORD length = GetModuleFileNameW(nullptr, path, MAX_PATH);
+    if (!length || length >= MAX_PATH)
+        return false;
+    const auto name = std::filesystem::path(std::wstring(path, length)).filename().wstring();
+    return _wcsicmp(name.c_str(), L"ff7rebirth.exe") == 0 ||
+           _wcsicmp(name.c_str(), L"ff7rebirth_.exe") == 0;
+}
 DXGI_FORMAT ReadFormat(DXGI_FORMAT f)
 {
     switch (f)
@@ -272,7 +282,7 @@ struct Backend::Impl
     bool firstPublished = false;
     bool asyncSingle = false;
     UINT64 asyncStart = 0;
-    UINT width = 0, height = 0, activePasses = 0, lastPasses = 0;
+    UINT width = 0, height = 0, activePasses = 0, lastPasses = 0, lastRequestedPasses = 0;
     HipSetFn hipSet = nullptr;
     int hipDevice = -1;
     std::mutex lock;
@@ -389,7 +399,14 @@ struct Backend::Impl
         At<uint8_t>(h, Rt::Enabled) = 1;
         At<uint8_t>(h, Rt::UseFsrInputs) = 1;
         At<uint8_t>(h, Rt::UseDepth) = 1;
-        At<int>(h, Rt::Tonemap) = -1;
+        // The runtime's automatic format tonemap also enables its luminance
+        // estimator when the game does not supply an exposure texture.  A
+        // nearly black transition can make that estimator jump to ~10000x,
+        // which presents as a full-screen flash on the next asynchronous
+        // replacement.  FF7's pre-SR input is already linear, so keep the
+        // native tonemap disabled and leave any explicit appearance tonemap
+        // to the host pass below.
+        At<int>(h, Rt::Tonemap) = IsFf7Rebirth() ? 0 : -1;
         std::string file = weights.string();
         if (hipSet(hipDevice) != 0 || !reinterpret_cast<InitFn>(reinterpret_cast<uintptr_t>(h) + Rt::InitFn)(
                                           reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(h) + Rt::EngineObject), &file))
@@ -576,7 +593,19 @@ ID3D12Resource* Backend::Record(ID3D12GraphicsCommandList* cmd, const Frame& inc
         }
         if (f.motion->GetDesc().Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)
             throw std::runtime_error("Unsupported depth-stencil motion buffer: " + Layout(f.motion));
-        p->activePasses = std::clamp(cfg.passes, 1u, 3u);
+        const UINT requestedPasses = std::clamp(cfg.passes, 1u, 3u);
+        if (requestedPasses != p->lastRequestedPasses)
+        {
+            p->lastRequestedPasses = requestedPasses;
+            if (requestedPasses > 1)
+                p->Log("AMD async Proton path supports one safe pass; requested " +
+                       std::to_string(requestedPasses) + ", using 1");
+        }
+        // Every private runtime instance uses HIP stream 0.  Waking a second
+        // asynchronous instance while the first owns the stream deadlocks the
+        // render submission thread under Proton.  Keep the backend safe even
+        // if an older ini still requests two or three passes.
+        p->activePasses = 1;
         bool passChange = p->lastPasses != p->activePasses;
         p->lastPasses = p->activePasses;
         for (UINT i = 0; i < p->activePasses; ++i)

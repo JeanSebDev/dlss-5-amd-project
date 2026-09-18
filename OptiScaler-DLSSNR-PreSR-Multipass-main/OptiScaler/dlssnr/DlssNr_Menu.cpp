@@ -157,12 +157,16 @@ void RenderMenu(Config* config, float menuResScale)
                 storage->SetFloat(id,value);storage->SetBool(activeId,active);
                 if(commit)option=value;
             };
-            static int passes = 1;
-            static bool editingPasses = false;
-            if(!editingPasses)passes=int(config->DlssNrPasses.value_or_default());
-            ImGui::SliderInt("AMD neural passes", &passes, 1, 3);
-            editingPasses=ImGui::IsItemActive();
-            if(ImGui::IsItemDeactivatedAfterEdit())config->DlssNrPasses=uint32_t(passes);
+            // The private AMD runtime is asynchronous under Proton and all
+            // instances share HIP stream 0.  Multiple passes can therefore
+            // deadlock the game's submission thread; expose only the safe
+            // value instead of offering a control that can hang the game.
+            config->DlssNrPasses = 1u;
+            int passes = 1;
+            ImGui::BeginDisabled();
+            ImGui::SliderInt("AMD neural passes", &passes, 1, 1);
+            ImGui::EndDisabled();
+            ImGui::TextDisabled("One pass only on the AMD Proton path");
             neuralSlider("Lightning Strength",config->AmdNeuralLightingStrength,0,1);
             neuralSlider("AMD structure",config->DlssNrLocalStructure,0,2);
             neuralSlider("AMD character structure",config->DlssNrSkinStructure,0,2);
@@ -285,7 +289,7 @@ void RenderMenu(Config* config, float menuResScale)
                 ImGui::TreePop();
             }
             ImGui::TextWrapped("%s", DlssNr::AmdBridge::Status().c_str());
-            ImGui::TextWrapped("AMD HIP backend. Each pass owns independent temporal history. More passes increase GPU time and memory. Restart the game after a backend failure.");
+            ImGui::TextWrapped("AMD HIP backend. The Proton path is limited to one asynchronous pass for stability. Restart the game after a backend failure.");
             return;
         }
 
@@ -1367,4 +1371,3 @@ void RenderMenu(Config* config, float menuResScale)
 }
 
 } // namespace DlssNr
-
