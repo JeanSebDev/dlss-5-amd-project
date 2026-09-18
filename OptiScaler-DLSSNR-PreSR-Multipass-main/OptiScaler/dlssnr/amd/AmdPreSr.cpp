@@ -289,7 +289,12 @@ struct Backend::Impl
         if (!asyncSingle) return;
         auto done = static_cast<UINT>(InterlockedCompareExchange(
             reinterpret_cast<volatile LONG*>(&At<UINT>(runtime[0], Rt::JobCounter)), 0, 0));
-        if (done < jobs[0] || fence->GetCompletedValue() < completion.load())
+        // The asynchronous counter is UINT_MAX until the first worker result
+        // is published.  An ordering comparison therefore treats that
+        // sentinel as newer than job 1 and retires the frame too early.  With
+        // only one outstanding job, equality is the exact completion
+        // contract and remains correct across counter wraparound.
+        if (done != jobs[0] || fence->GetCompletedValue() < completion.load())
         {
             if (!failed && GetTickCount64() - asyncStart > 5000)
             {
@@ -1070,7 +1075,7 @@ void Backend::Submitted(ID3D12CommandQueue* queue, UINT n, ID3D12CommandList* co
         // worker finished; otherwise its capture-wait kernel could block the first pass.
         auto start = GetTickCount64();
         while (static_cast<UINT>(InterlockedCompareExchange(reinterpret_cast<volatile LONG*>(&At<UINT>(h, Rt::JobCounter)), 0,
-                                                            0)) < p->jobs[i])
+                                                            0)) != p->jobs[i])
         {
             if (GetTickCount64() - start > 5000)
             {
