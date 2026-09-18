@@ -131,7 +131,8 @@ float3 delta(int2 p){p=clamp(p,0,int2(lowW-1,lowH-1));return edited.Load(int3(p,
  float4 c=src.Load(int3(p.xy,0));
  // A reduced neural pixel mixes surfaces and small emitters. Suppress its edit
  // where the original pixel disagrees with that footprint, rather than spreading
- // the edit blindly across high-contrast edges. No previous frame is reused.
+ // the edit blindly across high-contrast edges. In the asynchronous fallback,
+ // baseline/edited are the matching older pair while c is the current frame.
  int2 hi=int2(lowW-1,lowH-1);
  float3 b=lerp(lerp(baseline.Load(int3(clamp(a,0,hi),0)).rgb,baseline.Load(int3(clamp(a+int2(1,0),0,hi),0)).rgb,t.x),
  lerp(baseline.Load(int3(clamp(a+int2(0,1),0,hi),0)).rgb,baseline.Load(int3(clamp(a+1,0,hi),0)).rgb,t.x),t.y);
@@ -246,7 +247,7 @@ struct Backend::Impl
     ComPtr<ID3D12Device> device;
     ComPtr<ID3D12CommandQueue> queue;
     ComPtr<ID3D12Fence> fence;
-    ComPtr<ID3D12Resource> colour, scaleBaseline, scaleOutput;
+    ComPtr<ID3D12Resource> colour, neuralSlot, baselines[2], scaleOutput;
     ComPtr<ID3D12PipelineState> resolvePipeline;
     ComPtr<ID3D12Resource> motionCrop, depthCrop;
     ComPtr<ID3D12Resource> exposureCopy;
@@ -281,6 +282,8 @@ struct Backend::Impl
     bool resetAfterTimeout = false;
     bool firstPublished = false;
     bool asyncSingle = false;
+    bool haveBaseline = false;
+    UINT baselineWrite = 0;
     UINT64 asyncStart = 0;
     UINT width = 0, height = 0, activePasses = 0, lastPasses = 0, lastRequestedPasses = 0;
     HipSetFn hipSet = nullptr;
@@ -680,9 +683,15 @@ ID3D12Resource* Backend::Record(ID3D12GraphicsCommandList* cmd, const Frame& inc
             Check(p->device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
                 D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, nullptr, IID_PPV_ARGS(&resource)), "Guide scratch");
         };
+        // The private runtime's asynchronous fallback writes an older neural
+        // result into its colour argument.  Never give it the current frame:
+        // isolate that replacement in neuralSlot and preserve the matching
+        // input in a ping-pong baseline for host-side delta composition.
+        createScratch(p->neuralSlot,w,h,DXGI_FORMAT_R16G16B16A16_FLOAT);
+        createScratch(p->baselines[0],w,h,DXGI_FORMAT_R16G16B16A16_FLOAT);
+        createScratch(p->baselines[1],w,h,DXGI_FORMAT_R16G16B16A16_FLOAT);
+        createScratch(p->scaleOutput,inputW,inputH,DXGI_FORMAT_R16G16B16A16_FLOAT);
         if (scaled) {
-            createScratch(p->scaleBaseline,w,h,DXGI_FORMAT_R16G16B16A16_FLOAT);
-            createScratch(p->scaleOutput,inputW,inputH,DXGI_FORMAT_R16G16B16A16_FLOAT);
             createScratch(p->depthCrop,w,h,DXGI_FORMAT_R32_FLOAT);
             depth=p->depthCrop.Get();
         }
@@ -742,7 +751,7 @@ ID3D12Resource* Backend::Record(ID3D12GraphicsCommandList* cmd, const Frame& inc
         };
         if (resampleMotion) guideDescriptors(4, f.motion, motion, DXGI_FORMAT_R16G16_FLOAT);
         if (exposureSource) guideDescriptors(6, exposureSource, p->exposureCopy.Get(), DXGI_FORMAT_R32_FLOAT);
-        if (applyLook) guideDescriptors(8, p->colour.Get(), p->lookColour.Get(), DXGI_FORMAT_R16G16B16A16_FLOAT);
+        if (applyLook) guideDescriptors(8, p->neuralSlot.Get(), p->lookColour.Get(), DXGI_FORMAT_R16G16B16A16_FLOAT);
         if (convertDepth)
         {
             // Distinct descriptor slots: overwriting the colour descriptors here
@@ -826,17 +835,26 @@ ID3D12Resource* Backend::Record(ID3D12GraphicsCommandList* cmd, const Frame& inc
             Barrier(cmd, exposure, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         }
         UINT accepted = 0;
-        if (scaled) copyGuide(p->colour.Get(),p->scaleBaseline.Get());
+        const UINT currentBaseline = p->baselineWrite;
+        const UINT previousBaseline = 1u - currentBaseline;
+        copyGuide(p->colour.Get(), p->neuralSlot.Get());
+        copyGuide(p->colour.Get(), p->baselines[currentBaseline].Get());
         const bool settingsChanged = cfg.encoding != p->lastSettings.encoding || cfg.toneChannels != p->lastSettings.toneChannels || cfg.modelScale != p->lastSettings.modelScale || !p->haveSettings || cfg.tone != p->lastSettings.tone ||
                                      cfg.structure != p->lastSettings.structure || cfg.skin != p->lastSettings.skin;
         const bool explicitReset = p->resetRequested.exchange(false);
         const bool gap = p->lastSubmitted && GetTickCount64() - p->lastSubmitted > 250;
-        if (f.reset || resize || guideChange || passChange || p->resetAfterTimeout || settingsChanged || explicitReset || gap)
+        const bool historyReset = f.reset || resize || guideChange || passChange || p->resetAfterTimeout ||
+                                  settingsChanged || explicitReset || gap;
+        if (historyReset)
+        {
+            p->haveBaseline = false;
             p->Log("AMD history reset: frame=" + std::to_string(p->frames) +
                    " game=" + std::to_string(f.reset) + " resize=" + std::to_string(resize) +
                    " guides=" + std::to_string(guideChange) + " passes=" + std::to_string(passChange) +
                    " timeout=" + std::to_string(p->resetAfterTimeout) + " settings=" + std::to_string(settingsChanged) +
                    " explicit=" + std::to_string(explicitReset) + " gap=" + std::to_string(gap));
+        }
+        const bool havePreviousBaseline = p->haveBaseline;
         for (UINT i = 0; i < p->activePasses; ++i)
         {
             auto r = p->runtime[i];
@@ -847,7 +865,7 @@ ID3D12Resource* Backend::Record(ID3D12GraphicsCommandList* cmd, const Frame& inc
             At<uint8_t>(r, Rt::Temporal) = 1;
             // Engine +0x120 is the history-valid flag, +0x118 is the current
             // borrowed history view. Clear only at a quiescent frame boundary.
-            if (f.reset || resize || guideChange || passChange || p->resetAfterTimeout || settingsChanged || explicitReset || gap)
+            if (historyReset)
             {
                 At<uint8_t>(r, Rt::HistoryOn) = 0;
                 At<void*>(r, Rt::History) = nullptr;
@@ -857,13 +875,14 @@ ID3D12Resource* Backend::Record(ID3D12GraphicsCommandList* cmd, const Frame& inc
             At<float>(r, Rt::LocalTone) = i == 0 ? cfg.tone : 0;
             At<float>(r, Rt::LocalStructure) = cfg.structure;
             At<float>(r, Rt::SkinStructure) = cfg.skin;
-            // Bit 4 enables v0.3.1's safe timeout path; bit 2 stays clear so
-            // a late job never pastes a residual from an older frame.
+            // Value 4 requests the native residual route when the driver can
+            // support it.  Proton rejects the required typed UAV operations,
+            // so the host-side composition below remains the safe fallback.
             At<UINT>(r, Rt::ToneChannels) = (cfg.toneChannels ? 1u : 0u) | 4u;
             At<UINT>(r, Rt::UseAutoMask) = 1;
             Packet packet {};
             packet.list = cmd;
-            packet.colour = p->colour.Get();
+            packet.colour = p->neuralSlot.Get();
             packet.colourState = 4;
             packet.motion = motion;
             packet.motionState = 4;
@@ -896,15 +915,18 @@ ID3D12Resource* Backend::Record(ID3D12GraphicsCommandList* cmd, const Frame& inc
         Barrier(cmd, f.depth, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, f.depthState);
         Barrier(cmd, exposureSource, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, f.exposureState);
         p->activePasses = accepted;
+        const bool composeNeuralDelta = accepted && havePreviousBaseline;
         if (accepted)
         {
             ++p->frames;
             p->firstPublished = false;
             p->pending.store(cmd, std::memory_order_release);
+            p->haveBaseline = true;
+            p->baselineWrite = previousBaseline;
         }
         if (p->failed)
             return nullptr;
-        if (applyLook)
+        if (applyLook && composeNeuralDelta)
         {
             auto bounded = [](float v, float lo, float hi, float fallback) {
                 return std::isfinite(v) ? std::clamp(v, lo, hi) : fallback;
@@ -941,8 +963,8 @@ ID3D12Resource* Backend::Record(ID3D12GraphicsCommandList* cmd, const Frame& inc
             cmd->Dispatch((w + 7) / 8, (h + 7) / 8, 1);
             Barrier(cmd, p->lookColour.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         }
-        auto finalColour = applyLook ? p->lookColour.Get() : p->colour.Get();
-        if (cfg.rtgi.enabled && !p->rtgiFailed)
+        auto finalColour = composeNeuralDelta ? (applyLook ? p->lookColour.Get() : p->neuralSlot.Get()) : f.colour;
+        if (composeNeuralDelta && cfg.rtgi.enabled && !p->rtgiFailed)
         {
             try
             {
@@ -957,7 +979,7 @@ ID3D12Resource* Backend::Record(ID3D12GraphicsCommandList* cmd, const Frame& inc
                 rtgiFrame.motionState = motion == f.motion ? f.motionState : D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
                 rtgiFrame.motionScaleX *= resampleMotion ? float(w) / mvW : 1.0f;
                 rtgiFrame.motionScaleY *= resampleMotion ? float(h) / mvH : 1.0f;
-                rtgiFrame.reset |= resize || guideChange || passChange || p->resetAfterTimeout || explicitReset || gap;
+                rtgiFrame.reset |= historyReset;
                 finalColour = p->rtgi->Record(cmd, rtgiFrame, cfg.rtgi);
                 p->rtgiStatus = "Experimental effect active";
             }
@@ -970,18 +992,18 @@ ID3D12Resource* Backend::Record(ID3D12GraphicsCommandList* cmd, const Frame& inc
                 p->Log(p->rtgiStatus);
             }
         }
-        else if (!cfg.rtgi.enabled)
+        else if (!cfg.rtgi.enabled || !composeNeuralDelta)
         {
             if (p->rtgi) p->rtgi->ResetHistory();
             p->rtgiStatus.clear();
         }
-        if (scaled) {
+        if (composeNeuralDelta) {
             guideDescriptors(10,f.colour,p->scaleOutput.Get(),DXGI_FORMAT_R16G16B16A16_FLOAT);
             auto handle=p->heap->GetCPUDescriptorHandleForHeapStart();
             auto stride=p->device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
             handle.ptr+=12*stride;
             auto v=srv;v.Format=DXGI_FORMAT_R16G16B16A16_FLOAT;
-            p->device->CreateShaderResourceView(p->scaleBaseline.Get(),&v,handle);
+            p->device->CreateShaderResourceView(p->baselines[previousBaseline].Get(),&v,handle);
             handle.ptr+=stride;p->device->CreateShaderResourceView(finalColour,&v,handle);
             Barrier(cmd,f.colour,f.colourState,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
             Barrier(cmd,p->scaleOutput.Get(),D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -994,6 +1016,8 @@ ID3D12Resource* Backend::Record(ID3D12GraphicsCommandList* cmd, const Frame& inc
             Barrier(cmd,p->scaleOutput.Get(),D3D12_RESOURCE_STATE_UNORDERED_ACCESS,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
             Barrier(cmd,f.colour,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,f.colourState);
             finalColour=p->scaleOutput.Get();
+            if (p->frames <= 3)
+                p->Log("Host residual composed from matching asynchronous baseline");
         }
         p->resetAfterTimeout = false;
         p->lastSettings = cfg;
