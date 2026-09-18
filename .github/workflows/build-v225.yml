@@ -1,0 +1,31 @@
+name: Build OptiScaler AMD v2.25
+
+on:
+  push:
+    branches:
+      - codex/async-presr-build
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Add MSBuild to PATH
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Build corrected OptiScaler
+        working-directory: OptiScaler-DLSSNR-PreSR-Multipass-main
+        run: msbuild OptiScaler.sln /m /p:Configuration=Release /p:Platform=x64 /verbosity:minimal
+
+      - name: Upload corrected DLL
+        uses: actions/upload-artifact@v4
+        with:
+          name: OptiScaler-AMD-v225-async
+          path: OptiScaler-DLSSNR-PreSR-Multipass-main/x64/Release/OptiScaler.dll
+          if-no-files-found: error
+          retention-days: 7
