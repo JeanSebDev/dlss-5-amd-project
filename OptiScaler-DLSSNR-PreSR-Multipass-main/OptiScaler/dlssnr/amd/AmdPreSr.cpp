@@ -69,7 +69,13 @@ constexpr size_t HistoryOn = 0x9a220;
 constexpr size_t Ready = 0x9a420;
 constexpr size_t NativeFailure = 0x9a422;
 constexpr size_t InlineMode = 0x9a928;
-constexpr size_t JobCounter = 0x9a95c;
+// v0.3.1 maintains two different completion counters.  0x9a95c is the
+// same-frame/inline counter and remains zero when InlineMode is disabled.
+// The asynchronous worker publishes its retired job id at 0x9ac30 (an
+// interlocked exchange at the end of the worker).  Reading the inline counter
+// here made Proton accept exactly one neural frame and then wait forever even
+// though HIP and the D3D12 completion fence had both retired.
+constexpr size_t JobCounter = 0x9ac30;
 constexpr size_t Interop = 0x9ab0c;
 constexpr size_t ListMarker = 0x9ac38;
 constexpr size_t JobId = 0x9ac44;
