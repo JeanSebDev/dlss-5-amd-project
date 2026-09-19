@@ -3,6 +3,7 @@
 #include "ColorEncoding.h"
 #include "AmdLookShader.h"
 #include "RtgiNative.h"
+#include "../DlssNr_Capture.h"
 #include <wrl/client.h>
 #include <d3dcompiler.h>
 #include <bcrypt.h>
@@ -279,6 +280,10 @@ struct Backend::Impl
     UINT64 lastSubmitted = 0, lastCompleted = 0, completedFrames = 0;
     UINT64 pendingSkips = 0, fenceSkips = 0, fenceRecoveries = 0;
     UINT64 retryAfter = 0, timeoutEvents = 0;
+    capture::FrameCapture diagnosticCapture;
+    UINT64 diagnosticCaptureFence = 0;
+    bool diagnosticCaptureStarted = false;
+    bool diagnosticCaptureWritten = false;
     bool resetAfterTimeout = false;
     bool firstPublished = false;
     bool asyncSingle = false;
@@ -295,10 +300,26 @@ struct Backend::Impl
         std::ofstream out(directory / L"amd_presr.log", std::ios::app);
         out << GetTickCount64() << " " << s << '\n';
     }
+    void TryWriteDiagnosticCapture()
+    {
+        if (!diagnosticCapture.readyToWrite() || !diagnosticCaptureFence ||
+            fence->GetCompletedValue() < diagnosticCaptureFence)
+            return;
+        const auto path = diagnosticCapture.write(directory / L"amd-neural-capture");
+        diagnosticCaptureFence = 0;
+        if (!path.empty())
+        {
+            diagnosticCaptureWritten = true;
+            Log("AMD diagnostic: wrote a hidden matching baseline/neural pair to " + path);
+        }
+        else if (diagnosticCapture.isActive())
+            Log("AMD diagnostic: discarded a dark pair; capture re-armed");
+    }
     // Called with lock held. Keep every borrowed resource alive until BOTH
     // native inference and the actual D3D12 submission have retired.
     void RetireSingle()
     {
+        TryWriteDiagnosticCapture();
         if (!asyncSingle) return;
         auto done = static_cast<UINT>(InterlockedCompareExchange(
             reinterpret_cast<volatile LONG*>(&At<UINT>(runtime[0], Rt::JobCounter)), 0, 0));
@@ -327,6 +348,7 @@ struct Backend::Impl
             lastCompleted = lastSubmitted;
             status = "Completed AMD pre-SR passes=1 at " + std::to_string(width) + "x" + std::to_string(height);
         }
+        TryWriteDiagnosticCapture();
     }
     void InitHip()
     {
@@ -926,7 +948,7 @@ ID3D12Resource* Backend::Record(ID3D12GraphicsCommandList* cmd, const Frame& inc
         }
         if (p->failed)
             return nullptr;
-        if (applyLook && composeNeuralDelta)
+        if (cfg.applyModel && applyLook && composeNeuralDelta)
         {
             auto bounded = [](float v, float lo, float hi, float fallback) {
                 return std::isfinite(v) ? std::clamp(v, lo, hi) : fallback;
@@ -963,8 +985,22 @@ ID3D12Resource* Backend::Record(ID3D12GraphicsCommandList* cmd, const Frame& inc
             cmd->Dispatch((w + 7) / 8, (h + 7) / 8, 1);
             Barrier(cmd, p->lookColour.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         }
-        auto finalColour = composeNeuralDelta ? (applyLook ? p->lookColour.Get() : p->neuralSlot.Get()) : f.colour;
-        if (composeNeuralDelta && cfg.rtgi.enabled && !p->rtgiFailed)
+        auto finalColour = composeNeuralDelta ? (cfg.applyModel && applyLook ? p->lookColour.Get() : p->neuralSlot.Get()) : f.colour;
+        if (!cfg.applyModel && composeNeuralDelta && !p->diagnosticCaptureWritten)
+        {
+            if (!p->diagnosticCaptureStarted)
+            {
+                p->diagnosticCapture.request(1);
+                p->diagnosticCaptureStarted = true;
+                p->Log("AMD diagnostic: model output hidden; queuing a matching baseline/neural capture");
+            }
+            if (p->diagnosticCapture.isActive())
+                p->diagnosticCapture.record(cmd, p->device.Get(), p->baselines[previousBaseline].Get(),
+                                            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                                            p->neuralSlot.Get(),
+                                            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        }
+        if (cfg.applyModel && composeNeuralDelta && cfg.rtgi.enabled && !p->rtgiFailed)
         {
             try
             {
@@ -992,12 +1028,12 @@ ID3D12Resource* Backend::Record(ID3D12GraphicsCommandList* cmd, const Frame& inc
                 p->Log(p->rtgiStatus);
             }
         }
-        else if (!cfg.rtgi.enabled || !composeNeuralDelta)
+        else if (!cfg.applyModel || !cfg.rtgi.enabled || !composeNeuralDelta)
         {
             if (p->rtgi) p->rtgi->ResetHistory();
             p->rtgiStatus.clear();
         }
-        if (composeNeuralDelta) {
+        if (cfg.applyModel && composeNeuralDelta) {
             guideDescriptors(10,f.colour,p->scaleOutput.Get(),DXGI_FORMAT_R16G16B16A16_FLOAT);
             auto handle=p->heap->GetCPUDescriptorHandleForHeapStart();
             auto stride=p->device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
@@ -1029,6 +1065,12 @@ ID3D12Resource* Backend::Record(ID3D12GraphicsCommandList* cmd, const Frame& inc
         if (p->frames <= 3 || resize)
             p->Log("Recorded pre-SR " + std::to_string(w) + "x" + std::to_string(h) +
                    " passes=" + std::to_string(p->activePasses));
+        // Keep the private runtime working while exposing the untouched game
+        // frame.  This is the AMD equivalent of the existing "Apply the
+        // model" comparison switch and, crucially, gives diagnostics a safe
+        // path that cannot flash the screen.
+        if (!cfg.applyModel)
+            return nullptr;
         if(convertEncoding) finalColour=p->encode->Run(cmd,finalColour,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,inputW,inputH,cfg.encoding,true);
         return finalColour;
     }
@@ -1115,6 +1157,8 @@ void Backend::Submitted(ID3D12CommandQueue* queue, UINT n, ID3D12CommandList* co
             return;
         }
         p->completion.store(value);
+        if (p->diagnosticCapture.readyToWrite())
+            p->diagnosticCaptureFence = value;
         p->asyncStart = GetTickCount64();
         p->asyncSingle = true;
         return;
@@ -1146,6 +1190,8 @@ void Backend::Submitted(ID3D12CommandQueue* queue, UINT n, ID3D12CommandList* co
         p->Log("D3D12 completion Signal failed");
     }
     p->completion.store(value);
+    if (p->diagnosticCapture.readyToWrite())
+        p->diagnosticCaptureFence = value;
     p->pending.store(nullptr, std::memory_order_release);
     p->lastSubmitted = GetTickCount64();
     if (!p->failed)

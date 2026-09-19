@@ -281,6 +281,7 @@ bool Before(ID3D12GraphicsCommandList* cmd, NVSDK_NGX_Parameter* params, ID3D12C
     if (cfg.ExposureResourceBarrier.has_value())
         f.exposureState = static_cast<D3D12_RESOURCE_STATES>(cfg.ExposureResourceBarrier.value());
     AmdPreSr::Settings s {};
+    s.applyModel = cfg.DlssNrApplyModel.value_or_default();
     s.rtgi.enabled = cfg.AmdRtgiEnabled.value_or_default();
     s.rtgi.quality = cfg.AmdRtgiQuality.value_or_default();
     s.rtgi.denoiser = cfg.AmdRtgiDenoiser.value_or_default();
