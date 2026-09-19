@@ -292,7 +292,12 @@ struct Backend::Impl
     UINT64 asyncStart = 0;
     UINT width = 0, height = 0, activePasses = 0, lastPasses = 0, lastRequestedPasses = 0;
     static constexpr UINT PublishedCount = 3;
-    static constexpr UINT OutputCount = 6;
+    // The Proton fallback completes one native job every ~130-220 ms. At
+    // 90-120 fps, six outputs are exhausted before the command queue reaches
+    // their fences and a vanilla frame leaks through. Twenty-four FP16 outputs
+    // cover that measured latency on the 16 GiB target without stalling CPU
+    // recording or overwriting a resource still consumed by DLSS.
+    static constexpr UINT OutputCount = 24;
     struct PublishedPair
     {
         ComPtr<ID3D12Resource> baseline, edited;
