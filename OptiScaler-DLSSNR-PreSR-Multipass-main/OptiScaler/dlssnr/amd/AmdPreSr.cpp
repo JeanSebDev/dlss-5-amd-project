@@ -123,25 +123,56 @@ Texture2D<float4> baseline:register(t1);
 Texture2D<float4> edited:register(t2);
 RWTexture2D<float4> dst:register(u0);
 cbuffer Extent:register(b0){uint w,h,lowW,lowH;};
-float3 delta(int2 p){p=clamp(p,0,int2(lowW-1,lowH-1));return edited.Load(int3(p,0)).rgb-baseline.Load(int3(p,0)).rgb;}
+float3 sampleBaseline(float2 q){
+ int2 a=int2(floor(q));float2 t=frac(q);int2 hi=int2(lowW-1,lowH-1);
+ return lerp(lerp(baseline.Load(int3(clamp(a,0,hi),0)).rgb,baseline.Load(int3(clamp(a+int2(1,0),0,hi),0)).rgb,t.x),
+ lerp(baseline.Load(int3(clamp(a+int2(0,1),0,hi),0)).rgb,baseline.Load(int3(clamp(a+1,0,hi),0)).rgb,t.x),t.y);
+}
+float3 sampleEdited(float2 q){
+ int2 a=int2(floor(q));float2 t=frac(q);int2 hi=int2(lowW-1,lowH-1);
+ return lerp(lerp(edited.Load(int3(clamp(a,0,hi),0)).rgb,edited.Load(int3(clamp(a+int2(1,0),0,hi),0)).rgb,t.x),
+ lerp(edited.Load(int3(clamp(a+int2(0,1),0,hi),0)).rgb,edited.Load(int3(clamp(a+1,0,hi),0)).rgb,t.x),t.y);
+}
+float luminance(float3 v){return dot(max(v,0),float3(.2126,.7152,.0722));}
 [numthreads(8,8,1)] void main(uint3 p:SV_DispatchThreadID){
  if(p.x>=w||p.y>=h)return;
  float2 q=(float2(p.xy)+.5)*float2(lowW,lowH)/float2(w,h)-.5;
- int2 a=int2(floor(q));float2 t=frac(q);
- float3 d=lerp(lerp(delta(a),delta(a+int2(1,0)),t.x),lerp(delta(a+int2(0,1)),delta(a+1),t.x),t.y);
+ float3 b=sampleBaseline(q),e=sampleEdited(q);
+ // The private runtime has a low-frequency exposure bias under Proton. Measure
+ // it over a small neighbourhood and remove it without touching neural detail.
+ // Point samples keep this inexpensive while the centre remains bilinear.
+ int2 a=int2(round(q)),hi=int2(lowW-1,lowH-1);const int r=8;
+ float3 bLow=b,eLow=e;
+ bLow+=baseline.Load(int3(clamp(a+int2(r,0),0,hi),0)).rgb;
+ bLow+=baseline.Load(int3(clamp(a-int2(r,0),0,hi),0)).rgb;
+ bLow+=baseline.Load(int3(clamp(a+int2(0,r),0,hi),0)).rgb;
+ bLow+=baseline.Load(int3(clamp(a-int2(0,r),0,hi),0)).rgb;
+ eLow+=edited.Load(int3(clamp(a+int2(r,0),0,hi),0)).rgb;
+ eLow+=edited.Load(int3(clamp(a-int2(r,0),0,hi),0)).rgb;
+ eLow+=edited.Load(int3(clamp(a+int2(0,r),0,hi),0)).rgb;
+ eLow+=edited.Load(int3(clamp(a-int2(0,r),0,hi),0)).rgb;
+ bLow*=.2;eLow*=.2;
+ float exposureGain=clamp(luminance(bLow)/max(luminance(eLow),1e-5),.65,1.55);
+ e*=exposureGain;eLow*=exposureGain;
+ float3 d=e-b;
+ // Do not let an asynchronous/model-scale result soften an already sharper
+ // game input. Restore only detail energy that the neural edit removed; new
+ // detail created by the model remains untouched.
+ float3 baseDetail=b-bLow,editedDetail=e-eLow;
+ float baseEnergy=dot(abs(baseDetail),float3(.2126,.7152,.0722));
+ float editedEnergy=dot(abs(editedDetail),float3(.2126,.7152,.0722));
+ float restore=saturate((baseEnergy-editedEnergy)/max(baseEnergy,1e-4));
+ d+=(baseDetail-editedDetail)*restore;
  float4 c=src.Load(int3(p.xy,0));
  // A reduced neural pixel mixes surfaces and small emitters. Suppress its edit
  // where the original pixel disagrees with that footprint, rather than spreading
  // the edit blindly across high-contrast edges. In the asynchronous fallback,
  // baseline/edited are the matching older pair while c is the current frame.
- int2 hi=int2(lowW-1,lowH-1);
- float3 b=lerp(lerp(baseline.Load(int3(clamp(a,0,hi),0)).rgb,baseline.Load(int3(clamp(a+int2(1,0),0,hi),0)).rgb,t.x),
- lerp(baseline.Load(int3(clamp(a+int2(0,1),0,hi),0)).rgb,baseline.Load(int3(clamp(a+1,0,hi),0)).rgb,t.x),t.y);
  float3 magnitude=max(max(abs(c.rgb),abs(b)),1e-5);
  float mismatch=max(abs(c.r-b.r)/magnitude.r,max(abs(c.g-b.g)/magnitude.g,abs(c.b-b.b)/magnitude.b));
- float confidence=1-smoothstep(.15,.75,mismatch);
+ float confidence=1-smoothstep(.08,.35,mismatch);
  // Keep extreme low-resolution edits bounded relative to the current footprint.
- float3 limit=.5*max(abs(b),abs(c.rgb));
+ float3 limit=.35*max(abs(b),abs(c.rgb));
  d=clamp(d,-limit,limit)*confidence;
  dst[p.xy]=float4(clamp(c.rgb+d,0,65504),c.a);
 })";
@@ -609,7 +640,7 @@ struct Backend::Impl
         device->CreateShaderResourceView(source, &srv, cpu);
         cpu.ptr += stride;
         D3D12_UNORDERED_ACCESS_VIEW_DESC uav {};
-        uav.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        uav.Format = frame.output->GetDesc().Format;
         uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
         device->CreateUnorderedAccessView(frame.output.Get(), nullptr, &uav, cpu);
         cpu.ptr += stride;
@@ -899,7 +930,8 @@ ID3D12Resource* Backend::Record(ID3D12GraphicsCommandList* cmd, const Frame& inc
         const bool applyLook = look.enabled && (look.mix > 0 || look.tone > 0 || look.inspect != 0);
         auto createScratch = [&](ComPtr<ID3D12Resource>& resource, UINT sw, UINT sh, DXGI_FORMAT format)
         {
-            if (resource && resource->GetDesc().Width == sw && resource->GetDesc().Height == sh) return;
+            if (resource && resource->GetDesc().Width == sw && resource->GetDesc().Height == sh &&
+                resource->GetDesc().Format == format) return;
             resource.Reset();
             D3D12_HEAP_PROPERTIES hp {};
             hp.Type = D3D12_HEAP_TYPE_DEFAULT;
@@ -923,9 +955,16 @@ ID3D12Resource* Backend::Record(ID3D12GraphicsCommandList* cmd, const Frame& inc
             createScratch(pair.baseline,w,h,DXGI_FORMAT_R16G16B16A16_FLOAT);
             createScratch(pair.edited,w,h,DXGI_FORMAT_R16G16B16A16_FLOAT);
         }
+        DXGI_FORMAT continuityFormat = ReadFormat(desc.Format);
+        D3D12_FEATURE_DATA_FORMAT_SUPPORT formatSupport { continuityFormat };
+        if (FAILED(p->device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &formatSupport,
+                                                   sizeof(formatSupport))) ||
+            !(formatSupport.Support1 & D3D12_FORMAT_SUPPORT1_TEXTURE2D) ||
+            !(formatSupport.Support2 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE))
+            continuityFormat = DXGI_FORMAT_R16G16B16A16_FLOAT;
         for (auto& output : p->outputs)
         {
-            createScratch(output.output,inputW,inputH,DXGI_FORMAT_R16G16B16A16_FLOAT);
+            createScratch(output.output,inputW,inputH,continuityFormat);
             if (!output.heap)
             {
                 D3D12_DESCRIPTOR_HEAP_DESC hd { D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 4,
@@ -933,6 +972,8 @@ ID3D12Resource* Backend::Record(ID3D12GraphicsCommandList* cmd, const Frame& inc
                 Check(p->device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&output.heap)), "Continuity heap");
             }
         }
+        if (continuityResize)
+            p->Log("AMD continuity output format=" + std::to_string(static_cast<UINT>(continuityFormat)));
         if (scaled) {
             createScratch(p->depthCrop,w,h,DXGI_FORMAT_R32_FLOAT);
             depth=p->depthCrop.Get();
