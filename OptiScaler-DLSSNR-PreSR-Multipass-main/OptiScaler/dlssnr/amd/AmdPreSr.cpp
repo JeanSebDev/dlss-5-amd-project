@@ -248,7 +248,7 @@ struct Backend::Impl
     ComPtr<ID3D12Device> device;
     ComPtr<ID3D12CommandQueue> queue;
     ComPtr<ID3D12Fence> fence;
-    ComPtr<ID3D12Resource> colour, neuralSlot, baselines[2], scaleOutput;
+    ComPtr<ID3D12Resource> colour, neuralSlot, baselines[2];
     ComPtr<ID3D12PipelineState> resolvePipeline;
     ComPtr<ID3D12Resource> motionCrop, depthCrop;
     ComPtr<ID3D12Resource> exposureCopy;
@@ -291,6 +291,27 @@ struct Backend::Impl
     UINT baselineWrite = 0;
     UINT64 asyncStart = 0;
     UINT width = 0, height = 0, activePasses = 0, lastPasses = 0, lastRequestedPasses = 0;
+    static constexpr UINT PublishedCount = 3;
+    static constexpr UINT OutputCount = 6;
+    struct PublishedPair
+    {
+        ComPtr<ID3D12Resource> baseline, edited;
+        ID3D12CommandList* pendingList = nullptr;
+        UINT64 readyFence = 0;
+        bool valid = false;
+    };
+    struct OutputFrame
+    {
+        ComPtr<ID3D12Resource> output;
+        ComPtr<ID3D12DescriptorHeap> heap;
+        ID3D12CommandList* pendingList = nullptr;
+        UINT64 readyFence = 0;
+        int sourcePair = -1;
+    };
+    std::array<PublishedPair, PublishedCount> published {};
+    std::array<OutputFrame, OutputCount> outputs {};
+    int activePair = -1;
+    UINT64 reusedFrames = 0, continuityMisses = 0;
     HipSetFn hipSet = nullptr;
     int hipDevice = -1;
     std::mutex lock;
@@ -299,6 +320,83 @@ struct Backend::Impl
         status = s;
         std::ofstream out(directory / L"amd_presr.log", std::ios::app);
         out << GetTickCount64() << " " << s << '\n';
+    }
+    bool OutputBusy(const OutputFrame& output, UINT64 completed) const
+    {
+        return output.pendingList || (output.readyFence && completed < output.readyFence);
+    }
+    bool PairReferenced(UINT pair, UINT64 completed) const
+    {
+        for (const auto& output : outputs)
+            if (output.sourcePair == static_cast<int>(pair) && OutputBusy(output, completed))
+                return true;
+        return false;
+    }
+    int FindOutputSlot() const
+    {
+        const auto completed = fence->GetCompletedValue();
+        for (UINT i = 0; i < outputs.size(); ++i)
+            if (!OutputBusy(outputs[i], completed))
+                return static_cast<int>(i);
+        return -1;
+    }
+    int FindPublishSlot() const
+    {
+        const auto completed = fence->GetCompletedValue();
+        for (UINT i = 0; i < published.size(); ++i)
+        {
+            const auto& pair = published[i];
+            if (static_cast<int>(i) == activePair || pair.pendingList ||
+                (pair.readyFence && completed < pair.readyFence) || PairReferenced(i, completed))
+                continue;
+            return static_cast<int>(i);
+        }
+        return -1;
+    }
+    bool HasTrackedWork() const
+    {
+        const auto completed = fence->GetCompletedValue();
+        for (const auto& pair : published)
+            if (pair.pendingList || (pair.readyFence && completed < pair.readyFence))
+                return true;
+        for (const auto& output : outputs)
+            if (OutputBusy(output, completed))
+                return true;
+        return false;
+    }
+    bool Tracks(UINT count, ID3D12CommandList* const* lists) const
+    {
+        if (!lists) return false;
+        for (UINT n = 0; n < count; ++n)
+        {
+            for (const auto& pair : published)
+                if (pair.pendingList == lists[n]) return true;
+            for (const auto& output : outputs)
+                if (output.pendingList == lists[n]) return true;
+        }
+        return false;
+    }
+    void MarkTrackedSubmitted(UINT count, ID3D12CommandList* const* lists, UINT64 value)
+    {
+        for (UINT n = 0; n < count; ++n)
+        {
+            for (UINT i = 0; i < published.size(); ++i)
+            {
+                auto& pair = published[i];
+                if (pair.pendingList != lists[n]) continue;
+                pair.pendingList = nullptr;
+                pair.readyFence = value;
+                pair.valid = true;
+                activePair = static_cast<int>(i);
+                Log("AMD continuity: published neural residual pair " + std::to_string(i));
+            }
+            for (auto& output : outputs)
+            {
+                if (output.pendingList != lists[n]) continue;
+                output.pendingList = nullptr;
+                output.readyFence = value;
+            }
+        }
     }
     void TryWriteDiagnosticCapture()
     {
@@ -488,6 +586,84 @@ struct Backend::Impl
                                         D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0 };
         Check(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&heap)), "Crop heap");
     }
+    ID3D12Resource* RecordResolved(ID3D12GraphicsCommandList* cmd, ID3D12Resource* source,
+                                   D3D12_RESOURCE_STATES sourceState, UINT inputW, UINT inputH,
+                                   UINT pairIndex, UINT outputIndex)
+    {
+        auto& pair = published[pairIndex];
+        auto& frame = outputs[outputIndex];
+        if (!pair.baseline || !pair.edited || !frame.output || !frame.heap)
+            return nullptr;
+        auto cpu = frame.heap->GetCPUDescriptorHandleForHeapStart();
+        const auto stride = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        D3D12_SHADER_RESOURCE_VIEW_DESC srv {};
+        srv.Format = ReadFormat(source->GetDesc().Format);
+        srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srv.Texture2D.MipLevels = 1;
+        device->CreateShaderResourceView(source, &srv, cpu);
+        cpu.ptr += stride;
+        D3D12_UNORDERED_ACCESS_VIEW_DESC uav {};
+        uav.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+        device->CreateUnorderedAccessView(frame.output.Get(), nullptr, &uav, cpu);
+        cpu.ptr += stride;
+        srv.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        device->CreateShaderResourceView(pair.baseline.Get(), &srv, cpu);
+        cpu.ptr += stride;
+        device->CreateShaderResourceView(pair.edited.Get(), &srv, cpu);
+
+        Barrier(cmd, source, sourceState, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        Barrier(cmd, frame.output.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        cmd->SetComputeRootSignature(root.Get());
+        cmd->SetPipelineState(resolvePipeline.Get());
+        auto descriptorHeap = frame.heap.Get();
+        cmd->SetDescriptorHeaps(1, &descriptorHeap);
+        auto table = descriptorHeap->GetGPUDescriptorHandleForHeapStart();
+        cmd->SetComputeRootDescriptorTable(0, table);
+        table.ptr += 2 * stride;
+        cmd->SetComputeRootDescriptorTable(2, table);
+        UINT dimensions[] { inputW, inputH, width, height };
+        cmd->SetComputeRoot32BitConstants(1, 4, dimensions, 0);
+        cmd->Dispatch((inputW + 7) / 8, (inputH + 7) / 8, 1);
+        Barrier(cmd, frame.output.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        Barrier(cmd, source, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, sourceState);
+        frame.pendingList = cmd;
+        frame.sourcePair = static_cast<int>(pairIndex);
+        return frame.output.Get();
+    }
+    ID3D12Resource* ReuseLatest(ID3D12GraphicsCommandList* cmd, const Frame& f, const Settings& cfg)
+    {
+        if (!cfg.applyModel || cfg.encoding != 0 || f.reset || resetRequested.load() ||
+            activePair < 0 || !published[activePair].valid || !haveSettings ||
+            cfg.modelScale != lastSettings.modelScale || cfg.toneChannels != lastSettings.toneChannels ||
+            cfg.tone != lastSettings.tone || cfg.structure != lastSettings.structure || cfg.skin != lastSettings.skin)
+            return nullptr;
+        const auto desc = f.colour->GetDesc();
+        const UINT inputW = f.width ? f.width : static_cast<UINT>(desc.Width);
+        const UINT inputH = f.height ? f.height : desc.Height;
+        if (inputW != lastInputWidth || inputH != lastInputHeight ||
+            desc.SampleDesc.Count != 1 || desc.DepthOrArraySize != 1)
+            return nullptr;
+        const int slot = FindOutputSlot();
+        if (slot < 0)
+        {
+            if (++continuityMisses <= 3 || continuityMisses % 120 == 0)
+                Log("AMD continuity: every output slot is still in flight; count=" + std::to_string(continuityMisses));
+            return nullptr;
+        }
+        auto result = RecordResolved(cmd, f.colour, f.colourState, inputW, inputH,
+                                     static_cast<UINT>(activePair), static_cast<UINT>(slot));
+        if (result)
+        {
+            ++reusedFrames;
+            if (reusedFrames <= 3 || reusedFrames % 300 == 0)
+                Log("AMD continuity: reapplied latest neural residual on frame " + std::to_string(reusedFrames));
+        }
+        return result;
+    }
 };
 Backend::Backend(ID3D12Device* d, ID3D12CommandQueue* q, const std::filesystem::path& dir) : p(new Impl)
 {
@@ -520,8 +696,11 @@ ID3D12Resource* Backend::Record(ID3D12GraphicsCommandList* cmd, const Frame& inc
     }
     if (p->pending.load())
     {
+        if (auto replacement = p->ReuseLatest(cmd, f, cfg))
+            return replacement;
         if (++p->pendingSkips <= 3 || p->pendingSkips % 120 == 0)
-            p->Log("AMD skipped: previous neural submission still pending; count=" + std::to_string(p->pendingSkips));
+            p->Log("AMD waiting: previous neural submission still pending and no residual is ready; count=" +
+                   std::to_string(p->pendingSkips));
         return nullptr;
     }
     const auto completion = p->completion.load();
@@ -637,6 +816,28 @@ ID3D12Resource* Backend::Record(ID3D12GraphicsCommandList* cmd, const Frame& inc
             p->InitPass(i);
         p->InitShader();
         bool resize = p->width != w || p->height != h;
+        const bool continuityResize = resize || p->lastInputWidth != inputW || p->lastInputHeight != inputH;
+        if (continuityResize && p->HasTrackedWork())
+        {
+            p->Log("AMD continuity: waiting for retained output resources before resize");
+            return nullptr;
+        }
+        if (continuityResize)
+        {
+            p->activePair = -1;
+            for (auto& pair : p->published)
+            {
+                pair.pendingList = nullptr;
+                pair.readyFence = 0;
+                pair.valid = false;
+            }
+            for (auto& output : p->outputs)
+            {
+                output.pendingList = nullptr;
+                output.readyFence = 0;
+                output.sourcePair = -1;
+            }
+        }
         if (resize)
         {
             p->colour.Reset();
@@ -712,7 +913,21 @@ ID3D12Resource* Backend::Record(ID3D12GraphicsCommandList* cmd, const Frame& inc
         createScratch(p->neuralSlot,w,h,DXGI_FORMAT_R16G16B16A16_FLOAT);
         createScratch(p->baselines[0],w,h,DXGI_FORMAT_R16G16B16A16_FLOAT);
         createScratch(p->baselines[1],w,h,DXGI_FORMAT_R16G16B16A16_FLOAT);
-        createScratch(p->scaleOutput,inputW,inputH,DXGI_FORMAT_R16G16B16A16_FLOAT);
+        for (auto& pair : p->published)
+        {
+            createScratch(pair.baseline,w,h,DXGI_FORMAT_R16G16B16A16_FLOAT);
+            createScratch(pair.edited,w,h,DXGI_FORMAT_R16G16B16A16_FLOAT);
+        }
+        for (auto& output : p->outputs)
+        {
+            createScratch(output.output,inputW,inputH,DXGI_FORMAT_R16G16B16A16_FLOAT);
+            if (!output.heap)
+            {
+                D3D12_DESCRIPTOR_HEAP_DESC hd { D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 4,
+                                                D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0 };
+                Check(p->device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&output.heap)), "Continuity heap");
+            }
+        }
         if (scaled) {
             createScratch(p->depthCrop,w,h,DXGI_FORMAT_R32_FLOAT);
             depth=p->depthCrop.Get();
@@ -870,6 +1085,7 @@ ID3D12Resource* Backend::Record(ID3D12GraphicsCommandList* cmd, const Frame& inc
         if (historyReset)
         {
             p->haveBaseline = false;
+            p->activePair = -1;
             p->Log("AMD history reset: frame=" + std::to_string(p->frames) +
                    " game=" + std::to_string(f.reset) + " resize=" + std::to_string(resize) +
                    " guides=" + std::to_string(guideChange) + " passes=" + std::to_string(passChange) +
@@ -1034,26 +1250,34 @@ ID3D12Resource* Backend::Record(ID3D12GraphicsCommandList* cmd, const Frame& inc
             p->rtgiStatus.clear();
         }
         if (cfg.applyModel && composeNeuralDelta) {
-            guideDescriptors(10,f.colour,p->scaleOutput.Get(),DXGI_FORMAT_R16G16B16A16_FLOAT);
-            auto handle=p->heap->GetCPUDescriptorHandleForHeapStart();
-            auto stride=p->device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-            handle.ptr+=12*stride;
-            auto v=srv;v.Format=DXGI_FORMAT_R16G16B16A16_FLOAT;
-            p->device->CreateShaderResourceView(p->baselines[previousBaseline].Get(),&v,handle);
-            handle.ptr+=stride;p->device->CreateShaderResourceView(finalColour,&v,handle);
-            Barrier(cmd,f.colour,f.colourState,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-            Barrier(cmd,p->scaleOutput.Get(),D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-            cmd->SetComputeRootSignature(p->root.Get());cmd->SetDescriptorHeaps(1,&heap);
-            cmd->SetPipelineState(p->resolvePipeline.Get());
-            auto table=heap->GetGPUDescriptorHandleForHeapStart();table.ptr+=10*stride;cmd->SetComputeRootDescriptorTable(0,table);
-            table.ptr+=2*stride;cmd->SetComputeRootDescriptorTable(2,table);
-            UINT rc[]{inputW,inputH,w,h};cmd->SetComputeRoot32BitConstants(1,4,rc,0);
-            cmd->Dispatch((inputW+7)/8,(inputH+7)/8,1);
-            Barrier(cmd,p->scaleOutput.Get(),D3D12_RESOURCE_STATE_UNORDERED_ACCESS,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-            Barrier(cmd,f.colour,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,f.colourState);
-            finalColour=p->scaleOutput.Get();
-            if (p->frames <= 3)
-                p->Log("Host residual composed from matching asynchronous baseline");
+            const int pairSlot = p->FindPublishSlot();
+            const int outputSlot = p->FindOutputSlot();
+            if (pairSlot >= 0 && outputSlot >= 0)
+            {
+                auto& pair = p->published[static_cast<UINT>(pairSlot)];
+                // RecordFn uploads the completed asynchronous edit into
+                // finalColour on this list. Preserve it together with the
+                // exact older baseline before neuralSlot is recycled again.
+                copyGuide(p->baselines[previousBaseline].Get(), pair.baseline.Get());
+                copyGuide(finalColour, pair.edited.Get());
+                pair.pendingList = cmd;
+                pair.valid = false;
+                finalColour = p->RecordResolved(cmd, f.colour, f.colourState, inputW, inputH,
+                                                static_cast<UINT>(pairSlot), static_cast<UINT>(outputSlot));
+                if (!finalColour)
+                {
+                    pair.pendingList = nullptr;
+                    finalColour = f.colour;
+                }
+                else if (p->frames <= 3)
+                    p->Log("Host residual composed and retained for continuous presentation");
+            }
+            else
+            {
+                ++p->continuityMisses;
+                p->Log("AMD continuity: no safe residual/output slot; exposing the game frame");
+                finalColour = f.colour;
+            }
         }
         p->resetAfterTimeout = false;
         p->lastSettings = cfg;
@@ -1092,15 +1316,29 @@ int Backend::PendingListIndex(UINT count, ID3D12CommandList* const* lists) const
 void Backend::Submitting(ID3D12CommandQueue* queue, UINT n, ID3D12CommandList* const* lists)
 {
     auto pending = p->pending.load(std::memory_order_acquire);
-    if (!pending || !queue)
+    if (!queue || !lists)
         return;
     bool found = false;
     for (UINT i = 0; i < n; ++i)
         found |= lists[i] == pending;
-    if (!found)
-        return;
     std::lock_guard guard(p->lock);
-    if (p->pending.load() != pending || p->firstPublished)
+    const bool tracked = p->Tracks(n, lists);
+    if (!found && !tracked)
+        return;
+    // A retained residual can be consumed on another D3D12 queue. Establish
+    // the cross-queue dependency before ExecuteCommandLists; same-queue order
+    // already provides it for the normal render path.
+    if (tracked && queue != p->queue.Get())
+    {
+        UINT64 required = 0;
+        for (UINT listIndex = 0; listIndex < n; ++listIndex)
+            for (const auto& output : p->outputs)
+                if (output.pendingList == lists[listIndex] && output.sourcePair >= 0)
+                    required = (std::max)(required, p->published[output.sourcePair].readyFence);
+        if (required && p->fence->GetCompletedValue() < required)
+            queue->Wait(p->fence.Get(), required);
+    }
+    if (!found || p->pending.load() != pending || p->firstPublished)
         return;
     if (p->frames <= 3)
         p->Log("Neural submission: lists=" + std::to_string(n) + " queueType=" +
@@ -1133,14 +1371,27 @@ void Backend::Submitted(ID3D12CommandQueue* queue, UINT n, ID3D12CommandList* co
     // Fallback for callers using the original post-submit API.
     Submitting(queue, n, lists);
     auto pending = p->pending.load(std::memory_order_acquire);
-    if (!pending || !queue)
+    if (!queue || !lists)
         return;
     bool found = false;
     for (UINT i = 0; i < n; ++i)
         found |= lists[i] == pending;
-    if (!found)
-        return;
     std::lock_guard guard(p->lock);
+    const bool tracked = p->Tracks(n, lists);
+    if (!found && !tracked)
+        return;
+    if (!found)
+    {
+        const UINT64 value = ++p->serial;
+        if (FAILED(queue->Signal(p->fence.Get(), value)))
+        {
+            p->failed = true;
+            p->Log("D3D12 continuity Signal failed; resources retained");
+            return;
+        }
+        p->MarkTrackedSubmitted(n, lists, value);
+        return;
+    }
     if (p->pending.load() != pending)
         return;
     if (p->asyncSingle) return;
@@ -1157,6 +1408,7 @@ void Backend::Submitted(ID3D12CommandQueue* queue, UINT n, ID3D12CommandList* co
             return;
         }
         p->completion.store(value);
+        p->MarkTrackedSubmitted(n, lists, value);
         if (p->diagnosticCapture.readyToWrite())
             p->diagnosticCaptureFence = value;
         p->asyncStart = GetTickCount64();
@@ -1190,6 +1442,7 @@ void Backend::Submitted(ID3D12CommandQueue* queue, UINT n, ID3D12CommandList* co
         p->Log("D3D12 completion Signal failed");
     }
     p->completion.store(value);
+    p->MarkTrackedSubmitted(n, lists, value);
     if (p->diagnosticCapture.readyToWrite())
         p->diagnosticCaptureFence = value;
     p->pending.store(nullptr, std::memory_order_release);
@@ -1213,7 +1466,8 @@ std::string Backend::Status() const
     if (!p->failed && p->lastSubmitted)
         return p->status + (p->rtgiStatus.empty() ? "" : " | " + p->rtgiStatus) + " | completed frames=" + std::to_string(p->completedFrames) +
                (p->lastCompleted ? " last completion " + std::to_string((GetTickCount64() - p->lastCompleted) / 1000) + "s ago" : " no successful completion") +
-               " | skipped pending/GPU=" + std::to_string(p->pendingSkips) + "/" + std::to_string(p->fenceSkips);
+               " | continuous frames=" + std::to_string(p->reusedFrames) +
+               " | waiting/GPU=" + std::to_string(p->pendingSkips) + "/" + std::to_string(p->fenceSkips);
     return p->status;
 }
 UINT64 Backend::RecordedFrames() const { return p->frames; }
@@ -1222,13 +1476,14 @@ bool Backend::Ready()
 {
     std::lock_guard guard(p->lock);
     p->RetireSingle();
-    return !p->failed && !p->pending.load() && p->fence->GetCompletedValue() >= p->completion.load();
+    return !p->failed && !p->pending.load() && !p->HasTrackedWork() &&
+           p->fence->GetCompletedValue() >= p->completion.load();
 }
 bool Backend::Shutdown()
 {
     std::lock_guard guard(p->lock);
     p->RetireSingle();
-    if (p->pending.load() || p->fence->GetCompletedValue() < p->completion.load())
+    if (p->pending.load() || p->HasTrackedWork() || p->fence->GetCompletedValue() < p->completion.load())
         return false;
     // Runtime modules are pinned for process lifetime.  v0.3.1 has no stable
     // exported shutdown entry, so do not jump through the v0.2.14 RVA here.
