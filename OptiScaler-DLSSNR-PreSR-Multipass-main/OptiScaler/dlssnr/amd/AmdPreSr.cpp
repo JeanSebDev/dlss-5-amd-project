@@ -152,28 +152,35 @@ float luminance(float3 v){return dot(max(v,0),float3(.2126,.7152,.0722));}
  eLow+=edited.Load(int3(clamp(a+int2(0,r),0,hi),0)).rgb;
  eLow+=edited.Load(int3(clamp(a-int2(0,r),0,hi),0)).rgb;
  bLow*=.2;eLow*=.2;
- float exposureGain=clamp(luminance(bLow)/max(luminance(eLow),1e-5),.65,1.55);
- e*=exposureGain;eLow*=exposureGain;
- float3 d=e-b;
- // Do not let an asynchronous/model-scale result soften an already sharper
- // game input. Restore only detail energy that the neural edit removed; new
- // detail created by the model remains untouched.
- float3 baseDetail=b-bLow,editedDetail=e-eLow;
- float baseEnergy=dot(abs(baseDetail),float3(.2126,.7152,.0722));
- float editedEnergy=dot(abs(editedDetail),float3(.2126,.7152,.0722));
- float restore=saturate((baseEnergy-editedEnergy)/max(baseEnergy,1e-4));
- d+=(baseDetail-editedDetail)*restore;
  float4 c=src.Load(int3(p.xy,0));
- // A reduced neural pixel mixes surfaces and small emitters. Suppress its edit
- // where the original pixel disagrees with that footprint, rather than spreading
- // the edit blindly across high-contrast edges. In the asynchronous fallback,
- // baseline/edited are the matching older pair while c is the current frame.
+ // Proton cannot share the D3D12 image with HIP directly, so the neural result
+ // arrives several frames late.  Never transfer its low-frequency colour or
+ // exposure: that is what made the whole image darker and can also create broad
+ // temporal smearing.  Retain only luminance detail that the model added beyond
+ // the matching baseline.  The current frame remains the authority for tone,
+ // colour and all detail that was already present.
+ float baseDetail=luminance(b)-luminance(bLow);
+ float editedDetail=luminance(e)-luminance(eLow);
+ float baseEnergy=abs(baseDetail),editedEnergy=abs(editedDetail);
+ float addedEnergy=editedEnergy-baseEnergy;
+ float enhancement=smoothstep(.00015,.0015,addedEnergy);
+ // Existing edges must keep their polarity.  On a nearly flat baseline the
+ // model is allowed to introduce genuinely new fine structure.
+ float coherent=(baseEnergy<.0002||baseDetail*editedDetail>=0)?1:0;
+ float neuralDetail=(editedDetail-baseDetail)*enhancement*coherent;
+ // Suppress stale detail wherever the current frame no longer matches the
+ // older baseline used by the asynchronous neural job.
  float3 magnitude=max(max(abs(c.rgb),abs(b)),1e-5);
  float mismatch=max(abs(c.r-b.r)/magnitude.r,max(abs(c.g-b.g)/magnitude.g,abs(c.b-b.b)/magnitude.b));
  float confidence=1-smoothstep(.08,.35,mismatch);
- // Keep extreme low-resolution edits bounded relative to the current footprint.
- float3 limit=.35*max(abs(b),abs(c.rgb));
- d=clamp(d,-limit,limit)*confidence;
+ float currentLuma=luminance(c.rgb);
+ float visible=smoothstep(.001,.012,currentLuma);
+ float lumaLimit=.12*max(currentLuma,.002);
+ neuralDetail=clamp(neuralDetail,-lumaLimit,lumaLimit)*confidence*visible;
+ // Apply a luminance-only residual along the current pixel's colour direction,
+ // preventing the neural result from tinting materials or changing white balance.
+ float3 colourDirection=currentLuma>1e-5?c.rgb/currentLuma:float3(1,1,1);
+ float3 d=colourDirection*neuralDetail;
  dst[p.xy]=float4(clamp(c.rgb+d,0,65504),c.a);
 })";
 constexpr char DepthShader[] = R"(
