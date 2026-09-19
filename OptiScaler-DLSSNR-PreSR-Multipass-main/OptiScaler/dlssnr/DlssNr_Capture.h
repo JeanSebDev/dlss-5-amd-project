@@ -105,7 +105,7 @@ class FrameCapture
 
         // A dark frame -- a menu, a loading screen -- measures nothing. Discard the run and quietly
         // re-arm for the same length, so the set that finally lands is of actual gameplay.
-        if (captured_ > 0 && isDark(beforeShots_[0]))
+        if (captured_ > 0 && isDark(beforeShots_[0], beforeDesc_))
         {
             const unsigned int frames = wanted_;
             release();
@@ -261,7 +261,7 @@ class FrameCapture
 
     // Mean byte value across the image, sampled sparsely. Correct for 8-bit and 10-bit surfaces;
     // float surfaces of dark content read higher, which only means a float capture is never discarded.
-    static bool isDark(Shot& shot)
+    static bool isDark(Shot& shot, const D3D12_RESOURCE_DESC& desc)
     {
         if (shot.readback == nullptr || shot.bytes == 0)
             return false;
@@ -273,6 +273,37 @@ class FrameCapture
             return false;
 
         const unsigned char* p = (const unsigned char*) mapped;
+
+        // FP16 colour commonly carries alpha=1 even when RGB is exactly
+        // black.  Sampling arbitrary bytes therefore mistakes a black loading
+        // frame for useful content.  Inspect RGB half magnitudes explicitly
+        // and ignore alpha.  Positive and sign-stripped IEEE half values are
+        // ordered by magnitude; 0x1c00 is roughly 0.0039.
+        if (desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT)
+        {
+            unsigned long long bright = 0;
+            unsigned long long count = 0;
+            const unsigned int width = static_cast<unsigned int>(desc.Width);
+            const unsigned int height = desc.Height;
+            for (unsigned int y = 0; y < height; y += 17)
+            {
+                const auto* row = reinterpret_cast<const unsigned short*>(
+                    p + static_cast<size_t>(y) * shot.layout.Footprint.RowPitch);
+                for (unsigned int x = 0; x < width; x += 17)
+                {
+                    const auto* rgba = row + static_cast<size_t>(x) * 4;
+                    const unsigned short r = rgba[0] & 0x7fff;
+                    const unsigned short g = rgba[1] & 0x7fff;
+                    const unsigned short b = rgba[2] & 0x7fff;
+                    bright += r > 0x1c00 || g > 0x1c00 || b > 0x1c00;
+                    ++count;
+                }
+            }
+            D3D12_RANGE written = { 0, 0 };
+            shot.readback->Unmap(0, &written);
+            return count > 0 && bright * 100 < count;
+        }
+
         unsigned long long total = 0;
         unsigned long long count = 0;
 
