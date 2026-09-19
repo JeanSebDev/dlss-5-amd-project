@@ -18,6 +18,9 @@
 #include <magic_enum.hpp>
 #include "detours/detours.h"
 
+#include <algorithm>
+#include <cmath>
+
 static bool IsSL1AndDLSSGActive()
 {
     return State::Instance().streamlineVersion.major == 1 && State::Instance().activeFgInput == FGInput::DLSSG &&
@@ -864,7 +867,67 @@ sl::Result StreamlineHooks::hkslDLSSGetOptimalSettings(const sl::DLSSOptions& op
             localOptions.mode = sl::DLSSMode::eDLAA;
     }
 
-    return o_slDLSSGetOptimalSettings(localOptions, settings);
+    const auto result = o_slDLSSGetOptimalSettings(localOptions, settings);
+    if (result != sl::Result::eOk)
+        return result;
+
+    // Streamline has its own optimal-settings entry point and never reaches the
+    // NGX/FFX callbacks that already honour UpscaleRatioOverride. Games such as
+    // FFVII Rebirth therefore remained at DLAA/native resolution even though
+    // the global override was enabled. Apply the same ratio to the successful
+    // Streamline result so the engine allocates the intended render targets.
+    const auto* config = Config::Instance();
+    const float sliderLimit = config->ExtendedLimits.value_or_default() ? 0.1f : 1.0f;
+    const float ratio = config->UpscaleRatioOverrideValue.value_or_default();
+
+    if (!config->UpscaleRatioOverrideEnabled.value_or_default() || !std::isfinite(ratio) || ratio < sliderLimit ||
+        options.outputWidth == 0 || options.outputHeight == 0 || options.outputWidth == sl::INVALID_UINT ||
+        options.outputHeight == sl::INVALID_UINT)
+        return result;
+
+    uint32_t renderWidth = static_cast<uint32_t>(static_cast<float>(options.outputWidth) / ratio);
+    uint32_t renderHeight = static_cast<uint32_t>(static_cast<float>(options.outputHeight) / ratio);
+
+    if (config->RoundInternalResolution.has_value() && config->RoundInternalResolution.value() > 0)
+    {
+        const auto multiple = static_cast<uint32_t>(config->RoundInternalResolution.value());
+        renderWidth -= renderWidth % multiple;
+        renderHeight -= renderHeight % multiple;
+    }
+
+    renderWidth = std::max(1u, renderWidth);
+    renderHeight = std::max(1u, renderHeight);
+    settings.optimalRenderWidth = renderWidth;
+    settings.optimalRenderHeight = renderHeight;
+
+    // Preserve the normal DRS range unless its endpoints are explicitly
+    // overridden. DLAA reports a native-resolution minimum, which would clamp
+    // the new optimal size back to native, so lower that minimum as well.
+    if (config->DrsMinOverrideEnabled.value_or_default() || options.mode == sl::DLSSMode::eDLAA)
+    {
+        settings.renderWidthMin = renderWidth;
+        settings.renderHeightMin = renderHeight;
+    }
+    else
+    {
+        settings.renderWidthMin = std::min(settings.renderWidthMin, renderWidth);
+        settings.renderHeightMin = std::min(settings.renderHeightMin, renderHeight);
+    }
+
+    if (config->DrsMaxOverrideEnabled.value_or_default())
+    {
+        settings.renderWidthMax = renderWidth;
+        settings.renderHeightMax = renderHeight;
+    }
+    else
+    {
+        settings.renderWidthMax = std::max(settings.renderWidthMax, renderWidth);
+        settings.renderHeightMax = std::max(settings.renderHeightMax, renderHeight);
+    }
+
+    LOG_INFO("Streamline DLSS ratio override: display {}x{}, render {}x{}, ratio {:.3f}", options.outputWidth,
+             options.outputHeight, renderWidth, renderHeight, ratio);
+    return result;
 }
 
 bool StreamlineHooks::hkdlssg_slOnPluginLoad(sl::param::IParameters* params, const char* loaderJSON,
